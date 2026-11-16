@@ -27,6 +27,7 @@ from ovos_utils.xdg_utils import xdg_data_home
 from ovos_config.meta import get_xdg_base
 from ahocorasick_ner import AhocorasickNER
 from ocp_pipeline.legacy import LegacyCommonPlay
+from ocp_pipeline.legacy_gui import BUTTONS, LegacyNowPlaying, entry_meta
 from ocp_pipeline.context_classify import (
     ContextAwareClassifier,
     build_ner_list,
@@ -196,6 +197,14 @@ class OCPPipelineMatcher(ConfidenceMatcherPipeline, OVOSAbstractApplication):
         self.add_event("mycroft.audio.service.pause", self._handle_legacy_audio_pause)
         self.add_event("mycroft.audio.service.resume", self._handle_legacy_audio_resume)
         self.add_event("mycroft.audio.service.stop", self._handle_legacy_audio_stop)
+        # the now playing page while the legacy audio service plays
+        # (legacy_gui.py): position from the audio backend, and the page's
+        # buttons, which arrive as ovos.common_play.<event>
+        self.legacy_gui = LegacyNowPlaying(self.gui)
+        self.add_event("ovos.common_play.playback_time", self._handle_legacy_playback_time)
+        for event in BUTTONS:
+            self.add_event(f"{OCP_ID}.{event}", self._handle_legacy_gui_button)
+        self.add_event(f"{OCP_ID}.seek", self._handle_legacy_gui_seek)
         # Launch-time sync: there is no caller and no session yet, so this one
         # is deliberately context-free. A message with no session context
         # resolves to the default session, which is the right session for a
@@ -1784,6 +1793,7 @@ class OCPPipelineMatcher(ConfidenceMatcherPipeline, OVOSAbstractApplication):
         player = self.get_player(message)
         player.media_state = MediaState.LOADING_MEDIA
         playing = False
+        self.legacy_gui.reset()
         for idx, r in enumerate(results):
             real_uri = None
             if not (r.playback == PlaybackType.AUDIO or r.media_type in OCPQuery.cast2audio):
@@ -1805,6 +1815,13 @@ class OCPPipelineMatcher(ConfidenceMatcherPipeline, OVOSAbstractApplication):
                     LOG.exception(f"extraction failed: {r}")
             if not real_uri:
                 continue
+            # the audio service only reports the address back; keep what
+            # it is for the now playing page
+            if isinstance(r, Playlist):
+                for e in r.entries:
+                    self.legacy_gui.track(e.uri, entry_meta(e))
+            else:
+                self.legacy_gui.track(real_uri, entry_meta(r))
             if not playing:
                 playing = True
                 self.legacy_api.play(real_uri, utterance=phrase, source_message=message)
@@ -1821,6 +1838,7 @@ class OCPPipelineMatcher(ConfidenceMatcherPipeline, OVOSAbstractApplication):
             player.media_state = MediaState.NO_MEDIA
             player.skill_id = None
             self.update_player_proxy(player)
+            self.legacy_gui.ended()
 
     def _handle_legacy_audio_pause(self, message: Message):
         player = self.get_player(message)
@@ -1829,6 +1847,7 @@ class OCPPipelineMatcher(ConfidenceMatcherPipeline, OVOSAbstractApplication):
             player.media_state = MediaState.LOADED_MEDIA
             player = self._update_player_skill_id(player, message)
             self.update_player_proxy(player)
+            self.legacy_gui.paused()
 
     def _handle_legacy_audio_resume(self, message: Message):
         player = self.get_player(message)
@@ -1837,6 +1856,7 @@ class OCPPipelineMatcher(ConfidenceMatcherPipeline, OVOSAbstractApplication):
             player.media_state = MediaState.LOADED_MEDIA
             player = self._update_player_skill_id(player, message)
             self.update_player_proxy(player)
+            self.legacy_gui.resumed()
 
     def _handle_legacy_audio_start(self, message: Message):
         player = self.get_player(message)
@@ -1845,6 +1865,7 @@ class OCPPipelineMatcher(ConfidenceMatcherPipeline, OVOSAbstractApplication):
             player.media_state = MediaState.LOADED_MEDIA
             player = self._update_player_skill_id(player, message)
             self.update_player_proxy(player)
+            self.legacy_gui.playing(message.data.get("track"))
 
     def _handle_legacy_audio_end(self, message: Message):
         player = self.get_player(message)
@@ -1853,6 +1874,31 @@ class OCPPipelineMatcher(ConfidenceMatcherPipeline, OVOSAbstractApplication):
             player.media_state = MediaState.END_OF_MEDIA
             player.skill_id = None
             self.update_player_proxy(player)
+            self.legacy_gui.ended()
+
+    def _handle_legacy_playback_time(self, message: Message):
+        """The audio backend's position, for the now playing page (only
+        shown for legacy playback, so no player sync is needed here)."""
+        if self.legacy_gui.showing:
+            self.legacy_gui.position(message.data.get("position", 0),
+                                     message.data.get("length", 0))
+
+    def _handle_legacy_gui_button(self, message: Message):
+        """A button on the now playing page (ovos.common_play.<event>):
+        with the legacy audio service nothing else answers it, so it goes
+        to the audio service as the matching voice command would. Only
+        while this page is shown: ovos-media answers its own page."""
+        if not self.legacy_gui.showing:
+            return
+        event = message.msg_type.rsplit(".", 1)[-1]
+        self.bus.emit(message.forward(BUTTONS[event]))
+
+    def _handle_legacy_gui_seek(self, message: Message):
+        """The now playing page's seek bar (``seekValue`` in ms)."""
+        if not self.legacy_gui.showing:
+            return
+        self.bus.emit(message.forward("mycroft.audio.service.set_track_position",
+                                      {"position": int(message.data.get("seekValue", 0))}))
 
     @classmethod
     def _get_closest_lang(cls, lang: str) -> Optional[str]:
