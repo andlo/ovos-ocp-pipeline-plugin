@@ -12,7 +12,7 @@ from ovos_bus_client.apis.ocp import ClassicAudioServiceInterface
 from ovos_bus_client.apis.ocp import OCPInterface, OCPQuery
 from ovos_bus_client.client import MessageBusClient
 from ovos_bus_client.message import Message, dig_for_message
-from ovos_bus_client.session import SessionManager
+from ovos_bus_client.session import Session, SessionManager
 from ovos_config import Configuration
 from ovos_plugin_manager.ocp import available_extractors
 from ovos_plugin_manager.templates.pipeline import IntentHandlerMatch, ConfidenceMatcherPipeline, PipelinePlugin
@@ -852,8 +852,15 @@ class OCPPipelineMatcher(ConfidenceMatcherPipeline, OVOSAbstractApplication):
             player.player_state = PlayerState.PLAYING
             player.media_type = best.media_type
             self.update_player_proxy(player)
-            # add active skill to session
-            sess.activate_skill(best.skill_id)
+            # add active skill to session. A result from an in-process
+            # MediaProvider carries the provider's name as skill_id; that is
+            # no skill on the bus, so nothing would answer its stop ping or
+            # its "<skill_id>:stop" - OCP is what plays it, so OCP is the
+            # active skill then
+            if best.skill_id in self.media_providers:
+                sess.activate_skill(OCP_ID)
+            else:
+                sess.activate_skill(best.skill_id)
             message.context["session"] = sess.serialize()
             if not player.ocp_available:
                 self.legacy_play(results, query, message=message)
@@ -886,6 +893,29 @@ class OCPPipelineMatcher(ConfidenceMatcherPipeline, OVOSAbstractApplication):
         player.player_state = PlayerState.STOPPED
         player.skill_id = None
         self.update_player_proxy(player)
+
+    # the stop pipeline (OVOS-STOP-1): a bare "stop" while OCP plays
+    def can_stop(self, message: Message) -> bool:
+        """True while OCP is playing or paused in this message's Session,
+        so the stop pipeline's ping finds OCP and a bare "stop" stops the
+        playback, through ovos-media or the legacy audio service alike."""
+        sess = SessionManager.get(message)
+        player = self.ocp_sessions.get(sess.session_id)
+        return bool(player) and player.player_state in (PlayerState.PLAYING,
+                                                        PlayerState.PAUSED)
+
+    def stop_session(self, session: Session) -> bool:
+        """Stop what OCP plays in ``session`` (the stop pipeline's
+        ``<skill_id>:stop`` / ``stop:skill`` for OCP). Only stop_session is
+        implemented, not stop(), which also runs on shutdown."""
+        player = self.ocp_sessions.get(session.session_id)
+        if not player or player.player_state not in (PlayerState.PLAYING,
+                                                     PlayerState.PAUSED):
+            return False
+        self.handle_stop_intent(Message("ocp:media_stop",
+                                        context={"session": session.serialize(),
+                                                 "skill_id": OCP_ID}))
+        return True
 
     def handle_next_intent(self, message: Message):
         player = self.get_player(message)
